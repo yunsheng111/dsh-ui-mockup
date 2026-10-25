@@ -1,0 +1,1876 @@
+/**
+ * 「UI 草图」设置区块：单个 settings.section 挂四张子页（概览 / 提供方与模型 /
+ * 生成偏好 / 生成历史），子页内切换与已确认线框一致。
+ * 视觉完全使用 DSH 主题令牌（--dsw-*）与 UI primitives，浅/深色自适应；
+ * 数据面：偏好经同名 settings 命名空间镜像读写，历史/锚点/测试连接走私有 RPC 频道。
+ */
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+  type RefObject,
+} from 'react'
+import {
+  Button,
+  IconCheckOutline16,
+  IconChevronDownOutline14,
+  IconEditOutline16,
+  IconNewChatOutline16,
+  Input,
+  Menu,
+  StateDot,
+} from '@deepseek-ai/dsh-client-ui-primitives'
+import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
+import {
+  callPanel,
+  imageUrl,
+  HISTORY_PAGE_SIZE,
+  anchorPageOf,
+  type ConnectionFace,
+  type PrefScope,
+} from './shared.js'
+import {
+  DEFAULT_PROVIDER_ID,
+  PROVIDER_REGISTRY,
+  normalizeBaseUrl,
+  providerMetaOf,
+  providerOf,
+} from '../providers.js'
+import type { NS, UiMockupKey } from './locales.js'
+import panelCss from './settings-panel.css?inline'
+
+/** 偏好形状的客户端本地副本（不引入宿主 prefs 模块，避免把 schemastery 打进浏览器包）。 */
+export interface PanelPrefs {
+  defaultFidelity: 'wireframe' | 'high-fidelity'
+  defaultPlatform: 'web' | 'mobile'
+  defaultCount: number
+  outputDir: string
+  pollTimeoutMinutes: number
+  wireframeModel: string
+  highFidelityModel: string
+  /** 方向稿模型（fastPreview）；面板本地默认须与宿主 DEFAULT_PREFS 同步。 */
+  draftModel: string
+  defaultSize: string
+}
+
+/** 面板本地默认值：须与宿主 DEFAULT_PREFS 保持一致（改动时两侧同步）。 */
+const PANEL_DEFAULTS: PanelPrefs = {
+  defaultFidelity: 'wireframe',
+  defaultPlatform: 'web',
+  defaultCount: 2,
+  outputDir: 'design/images',
+  pollTimeoutMinutes: 10,
+  wireframeModel: '',
+  highFidelityModel: '',
+  draftModel: '',
+  defaultSize: '',
+}
+
+/**
+ * settings 域的客户端结构面（bind 由 ui-settings 插件在运行时提供）。
+ * 面板经由它把同名命名空间镜像绑到本插件 fiber；ScopeSnapshot/PrefScope
+ * 定义见 ./shared.js，客户端本地不再重复。
+ */
+
+/** 注入给面板组件的运行时句柄。 */
+export interface UiMockupPanelInjected {
+  prefs: PrefScope<PanelPrefs>
+  connection: ConnectionFace
+}
+
+type PanelProps = PropsLocale<typeof NS> & UiMockupPanelInjected
+
+const SUBPAGES = ['overview', 'provider', 'preferences', 'history'] as const
+type SubPage = (typeof SUBPAGES)[number]
+
+/** 子页标题 key 表（i18n词条 panel.tab.*）。 */
+const TAB_KEYS: Record<SubPage, `panel.tab.${SubPage}`> = {
+  overview: 'panel.tab.overview',
+  provider: 'panel.tab.provider',
+  preferences: 'panel.tab.preferences',
+  history: 'panel.tab.history',
+}
+
+export function UiMockupSection({ t, prefs, connection }: PanelProps) {
+  const [page, setPage] = useState<SubPage>('overview')
+  const tabsId = useId()
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([])
+
+  const selectTabFromKeyboard = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+    const nextIndex =
+      event.key === 'Home'
+        ? 0
+        : event.key === 'End'
+          ? SUBPAGES.length - 1
+          : event.key === 'ArrowRight'
+            ? (index + 1) % SUBPAGES.length
+            : event.key === 'ArrowLeft'
+              ? (index - 1 + SUBPAGES.length) % SUBPAGES.length
+              : null
+    if (nextIndex === null) return
+    const nextPage = SUBPAGES[nextIndex]
+    if (nextPage === undefined) return
+    event.preventDefault()
+    setPage(nextPage)
+    tabRefs.current[nextIndex]?.focus()
+  }
+
+  const activeTabId = `${tabsId}-tab-${page}`
+  const activePanelId = `${tabsId}-panel-${page}`
+  return (
+    <div className="ui-mockup-section" style={sectionStyle}>
+      <style data-ui-mockup-styles>{panelCss}</style>
+      {/* 子页切换：对齐原生 Plugins 设置区的 tab 范式（底边线 + active 下划线） */}
+      <div role="tablist" aria-label={t('panel.nav')} className="ui-mockup-tabs" style={tabsStyle}>
+        {SUBPAGES.map((key, index) => (
+          <button
+            key={key}
+            id={`${tabsId}-tab-${key}`}
+            ref={(element) => {
+              tabRefs.current[index] = element
+            }}
+            type="button"
+            role="tab"
+            className="ui-mockup-tab"
+            aria-selected={page === key}
+            aria-controls={`${tabsId}-panel-${key}`}
+            tabIndex={page === key ? 0 : -1}
+            data-active={page === key}
+            onClick={() => setPage(key)}
+            onKeyDown={(event) => selectTabFromKeyboard(event, index)}
+            style={page === key ? { ...tabStyle, ...tabActiveStyle } : tabStyle}
+          >
+            {t(TAB_KEYS[key])}
+          </button>
+        ))}
+      </div>
+      <div
+        id={activePanelId}
+        role="tabpanel"
+        aria-labelledby={activeTabId}
+        className="ui-mockup-tabpanel"
+        tabIndex={0}
+      >
+        {page === 'overview' && <OverviewPage t={t} connection={connection} />}
+        {page === 'provider' && <ProviderPage t={t} prefs={prefs} connection={connection} />}
+        {page === 'preferences' && <PreferencesPage t={t} prefs={prefs} />}
+        {page === 'history' && <HistoryPage t={t} connection={connection} />}
+      </div>
+    </div>
+  )
+}
+
+/* ---------------- 原生令牌与共享原子 ---------------- */
+
+/**
+ * DSH 真实主题令牌（--dsw-alias-*，与 ui-theme / ui-settings-plugins 的
+ * module.css 同名同用途）与原生设置区实测尺寸。布局仍用内联样式，但取值
+ * 逐项对齐 fields.module.css / PluginsSettingsSection.module.css，不再自造。
+ */
+const tokens = {
+  labelPrimary: 'var(--dsw-alias-label-primary)',
+  labelSecondary: 'var(--dsw-alias-label-secondary)',
+  labelTertiary: 'var(--dsw-alias-label-tertiary)',
+  labelError: 'var(--dsw-alias-label-error)',
+  border: 'var(--dsw-alias-border-l2)',
+  bgLayer: 'var(--dsw-alias-bg-layer-3)',
+  brand: 'var(--dsw-alias-brand-primary)',
+} as const
+
+/** 面板根容器：与原生设置 section 同宽（max-width 760px）。 */
+const sectionStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 12,
+  maxWidth: 760,
+  width: '100%',
+  color: tokens.labelPrimary,
+} as const
+
+const tabsStyle = {
+  display: 'flex',
+  alignItems: 'flex-end',
+  borderBottom: `1px solid ${tokens.border}`,
+  marginTop: 2,
+} as const
+
+const tabStyle = {
+  position: 'relative' as const,
+  border: 0,
+  padding: '7px 1px 9px',
+  background: 'transparent',
+  color: tokens.labelTertiary,
+  font: 'inherit',
+  fontSize: 13,
+  lineHeight: '20px',
+  cursor: 'pointer',
+}
+
+const tabActiveStyle = {
+  color: tokens.labelPrimary,
+} as const
+
+/** 状态点：直接复用原语 StateDot（done 绿 / warning 琥珀），观感与会话列表一致。 */
+function StatusDot({ ok, busy }: { ok: boolean; busy?: boolean }) {
+  return <StateDot state={busy ? 'ongoing' : ok ? 'done' : 'warning'} className="ui-mockup-dot" />
+}
+
+/**
+ * 卡片容器：恢复已确认线框的圆角卡片布局，视觉用真实令牌
+ * （border-l2 边框 / 8px 圆角 / 标题 15px·600 对齐原生 heading 层级）。
+ */
+function Card({ title, children }: { title?: string; children: ReactNode }) {
+  return (
+    <div
+      className="ui-mockup-card"
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+        border: `1px solid ${tokens.border}`,
+        borderRadius: 8,
+        padding: '10px 12px',
+      }}
+    >
+      {title !== undefined && (
+        <span style={{ fontSize: 15, fontWeight: 600, lineHeight: '22px' }}>{title}</span>
+      )}
+      {children}
+    </div>
+  )
+}
+
+/**
+ * 提供方页的配置区块：标题、说明和状态/操作拥有固定层级，并通过原生 section
+ * 暴露可访问区域名称。视觉仍沿用宿主令牌，避免把每一行再包成嵌套卡片。
+ */
+function ConfigSection({
+  title,
+  description,
+  aside,
+  children,
+}: {
+  title: string
+  description?: string
+  aside?: ReactNode
+  children: ReactNode
+}) {
+  const titleId = useId()
+  return (
+    <section aria-labelledby={titleId} className="ui-mockup-config-section">
+      <header className="ui-mockup-config-header">
+        <div className="ui-mockup-config-heading">
+          <h3 id={titleId} className="ui-mockup-config-title">
+            {title}
+          </h3>
+          {description !== undefined && (
+            <p className="ui-mockup-config-description">{description}</p>
+          )}
+        </div>
+        {aside !== undefined && <div className="ui-mockup-config-aside">{aside}</div>}
+      </header>
+      {children}
+    </section>
+  )
+}
+
+/**
+ * 字段行：横排（label 左 96px，控件右）。为对齐原生 `.field + .field { border-top }`
+ * 的表单节奏，相邻字段行之间画 1px 分隔线；卡片内首行由调用方传 `first` 免除。
+ * 内容区统一 min-height 34（控件基准高）并垂直居中，使 radio / 输入框 / 纯文字行
+ * 各行等高、底边齐平，分隔线间距一致。
+ * 无障碍：用 role=group + aria-labelledby 而非 <label> 包裹——单个 label 只能
+ * 隐式关联一个可标记元素，多 radio 场景下其余选项会失去标签关联。
+ */
+function FieldRow({
+  label,
+  children,
+  first = false,
+}: {
+  label: string
+  children: ReactNode
+  first?: boolean
+}) {
+  const labelId = useId()
+  return (
+    <div
+      role="group"
+      aria-labelledby={labelId}
+      className="ui-mockup-field-row"
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
+        flexWrap: 'wrap',
+        minHeight: 34,
+        paddingTop: 10,
+        ...(first ? {} : { borderTop: `1px solid ${tokens.border}` }),
+      }}
+    >
+      <span
+        id={labelId}
+        className="ui-mockup-field-label"
+        style={{ fontSize: 13, lineHeight: '20px', color: tokens.labelSecondary }}
+      >
+        {label}
+      </span>
+      {children}
+    </div>
+  )
+}
+
+/** 提示行：对齐原生 hint（12px tertiary）/ invalid（12px error），不带边框。 */
+function Notice({ children, danger }: { children: ReactNode; danger?: boolean }) {
+  return (
+    <p
+      style={{
+        margin: 0,
+        fontSize: 12,
+        lineHeight: '20px',
+        color: danger ? tokens.labelError : tokens.labelTertiary,
+      }}
+    >
+      {children}
+    </p>
+  )
+}
+
+/* ---------------- 概览 ---------------- */
+
+/** 快速使用三步的图标与词条键（显式常量，规避模板字面量推断不进字典联合）。 */
+const QUICK_STEPS = [
+  {
+    Icon: IconNewChatOutline16,
+    title: 'panel.overview.step1Title',
+    body: 'panel.overview.step1Body',
+  },
+  { Icon: IconEditOutline16, title: 'panel.overview.step2Title', body: 'panel.overview.step2Body' },
+  {
+    Icon: IconCheckOutline16,
+    title: 'panel.overview.step3Title',
+    body: 'panel.overview.step3Body',
+  },
+] as const
+
+/** 面板用的凭据状态（与宿主 CredentialStatus 同构）：只有三个事实，永不携带值。 */
+export interface PanelCredential {
+  configured: boolean
+  source?: string
+  writable: boolean
+}
+
+interface OverviewData {
+  provider: string
+  credential: PanelCredential
+  anchor: string | null
+}
+
+function OverviewPage({ t, connection }: Omit<PanelProps, 'prefs'>) {
+  const [data, setData] = useState<OverviewData>()
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let alive = true
+    callPanel<OverviewData>(connection, 'overview')
+      .then((value) => {
+        if (alive) setData(value)
+      })
+      .catch((err: unknown) => {
+        if (alive) setError(err instanceof Error ? err.message : String(err))
+      })
+    return () => {
+      alive = false
+    }
+  }, [connection])
+
+  if (error !== '') return <Notice danger>{t('panel.loadFailed', { error })}</Notice>
+  if (data === undefined)
+    return <div style={{ color: tokens.labelTertiary }}>{t('panel.loading')}</div>
+
+  // 生效提供方元数据：unknown（未挂载 image 服务）无注册条目，凭据名走默认提供方回退
+  const overviewMeta = providerOf(data.provider)
+  const overviewCredential = overviewMeta?.credential ?? providerMetaOf('unknown').credential
+
+  return (
+    <div
+      className="ui-mockup-overview"
+      style={{ display: 'flex', flexDirection: 'column', gap: 12 }}
+    >
+      <p style={{ margin: 0, fontSize: 13, lineHeight: '20px', color: tokens.labelTertiary }}>
+        {t('panel.overview.intro')}
+      </p>
+      <Card title={t('panel.overview.quickTitle')}>
+        {QUICK_STEPS.map(({ Icon, title, body }) => (
+          <div
+            key={title}
+            className="ui-mockup-quick-step"
+            style={{ display: 'flex', alignItems: 'flex-start', flexWrap: 'nowrap', gap: 8 }}
+          >
+            <span aria-hidden style={{ flex: 'none', color: tokens.labelSecondary, marginTop: 2 }}>
+              <Icon size={16} />
+            </span>
+            <p
+              style={{
+                flex: '1 1 0%',
+                minWidth: 0,
+                margin: 0,
+                lineHeight: '20px',
+                overflowWrap: 'anywhere',
+              }}
+            >
+              <strong style={{ fontSize: 13 }}>{t(title)}</strong>
+              <br />
+              <span style={{ fontSize: 13, color: tokens.labelSecondary }}>{t(body)}</span>
+            </p>
+          </div>
+        ))}
+      </Card>
+      <div
+        className="ui-mockup-overview-status"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          fontSize: 13,
+          lineHeight: '20px',
+          color: tokens.labelSecondary,
+        }}
+      >
+        <StatusDot ok={data.credential.configured} />
+        {t('panel.overview.statusLine', {
+          // 生效提供方由宿主端点给出；unknown（未挂载 image 服务）单独措辞
+          provider:
+            overviewMeta !== undefined ? t(overviewMeta.nameKey) : t('panel.provider.unknown'),
+          credential: data.credential.configured
+            ? t('panel.credential.ready')
+            : t('panel.credential.missing', { credential: overviewCredential }),
+        })}
+      </div>
+    </div>
+  )
+}
+
+/* ---------------- 提供方与模型 ---------------- */
+
+/** 来源层 id → 词条键（显式映射，规避模板字面量推断不进字典联合）。 */
+const SOURCE_LABELS: Record<string, UiMockupKey> = {
+  env: 'panel.credential.source.env',
+  file: 'panel.credential.source.file',
+  'project-env': 'panel.credential.source.project-env',
+  'user-env': 'panel.credential.source.user-env',
+  ambient: 'panel.credential.source.ambient',
+}
+
+function sourceLabelText(t: PanelProps['t'], source: string | undefined): string | undefined {
+  if (source === undefined) return undefined
+  const key = SOURCE_LABELS[source]
+  return key === undefined ? source : t(key)
+}
+
+function ProviderPage({ t, prefs, connection }: PanelProps) {
+  const snap = prefs.getSnapshot()
+  usePrefSync(prefs)
+  const baseUrlInputId = useId()
+  const credentialInputId = useId()
+  const [testResult, setTestResult] = useState<string | null>(null)
+  const [testing, setTesting] = useState(false)
+  const [writeError, setWriteError] = useState('')
+  // 生效提供方 id（宿主 provider/status 端点返回；unknown = 未挂载 image 服务），
+  // 决定卡片选中态/凭据名/模型 hints——全部经元数据表查得
+  const [providerId, setProviderId] = useState<string>('unknown')
+  // 端点不可达（旧宿主/纯内存部署）时置位：面板按安装默认（DashScope）渲染并说明原因，
+  // 而不是把"检测不到"误显示成"未启用"。
+  const [statusUnknown, setStatusUnknown] = useState(true)
+  // 切换请求进行中：期间两张卡禁点，完成后刷新状态
+  const [switching, setSwitching] = useState(false)
+  // 切换落位后的伴随提示（如模型分层默认被重置）
+  const [providerNotice, setProviderNotice] = useState<string | null>(null)
+  // 凭据状态（configured/source/writable，永不含值）：写入/清除后刷新
+  const [credential, setCredential] = useState<PanelCredential | undefined>()
+  const [keyDraft, setKeyDraft] = useState('')
+  const [keyBusy, setKeyBusy] = useState(false)
+  const [keyNotice, setKeyNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
+  // 连接配置（仅 openai-compat）：生效网关地址回显 + 本地草稿（null = 未编辑）
+  const [effectiveBaseUrl, setEffectiveBaseUrl] = useState('')
+  const [baseUrlDraft, setBaseUrlDraft] = useState<string | null>(null)
+  const [baseUrlBusy, setBaseUrlBusy] = useState(false)
+  const [openModelTier, setOpenModelTier] = useState<'wireframe' | 'highFidelity' | 'draft' | null>(
+    null,
+  )
+  const [baseUrlNotice, setBaseUrlNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(
+    null,
+  )
+
+  const refreshProviderStatus = useCallback(async (): Promise<string> => {
+    try {
+      const value = await callPanel<{ active: string; baseUrl?: string }>(
+        connection,
+        'provider/status',
+      )
+      setProviderId(value.active)
+      setEffectiveBaseUrl(typeof value.baseUrl === 'string' ? value.baseUrl : '')
+      setStatusUnknown(false)
+      return value.active
+    } catch {
+      setProviderId('unknown')
+      setEffectiveBaseUrl('')
+      setStatusUnknown(true)
+      return 'unknown'
+    }
+  }, [connection])
+
+  useEffect(() => {
+    void refreshProviderStatus()
+  }, [refreshProviderStatus])
+
+  // 生效提供方元数据（未注册 id 走渲染回退条目）：凭据名与三档模型候选的唯一来源
+  const activeMeta = providerMetaOf(providerId)
+  const credentialName = activeMeta.credential
+
+  /** 一键切换生效提供方：宿主改写 home 用户层 patch（DSH 热重载），完成后刷新状态。 */
+  const switchProvider = async (target: string) => {
+    if (switching) return
+    setSwitching(true)
+    setProviderNotice(null)
+    try {
+      const result = await callPanel<{ active: string; pending?: boolean }>(
+        connection,
+        'provider/switch',
+        { provider: target },
+      )
+      let activeAfterSwitch = result.active
+      if (result.pending === true) {
+        // 8秒边界后热重载可能恰在响应与客户端刷新之间完成；以最新权威状态
+        // 决定是显示 pending，还是执行目标提供方的模型重置。
+        activeAfterSwitch = await refreshProviderStatus()
+      }
+      // 切换落位后重置模型分层默认：模型 ID 是提供方私有的，旧提供方的值
+      // 残留会被当作显式 model 直传新网关而必败（INVALID_PARAMETER）。
+      // best-effort：只读/内存态偏好写不进时不阻断切换，用户可手动改回。
+      // patch 已经写入但 HMR 尚未落位时也要先清空旧 Provider 私有模型 ID；
+      // 否则它稍后落位或下次重启后会收到不兼容的显式 model。
+      // 重置与 pending 提示可能同时成立：分段收集后合并展示，避免后者覆盖前者。
+      const notices: string[] = []
+      if (activeAfterSwitch === target || result.pending === true) {
+        const current = prefs.getSnapshot().value
+        if (
+          current !== undefined &&
+          (current.wireframeModel !== '' ||
+            current.highFidelityModel !== '' ||
+            current.draftModel !== '')
+        ) {
+          try {
+            await prefs.set('wireframeModel', '')
+            await prefs.set('highFidelityModel', '')
+            await prefs.set('draftModel', '')
+            notices.push(t('panel.provider.modelsReset'))
+          } catch {
+            // 偏好不可写：切换本身已成功，重置跳过
+          }
+        }
+      }
+      if (result.pending === true && activeAfterSwitch !== target) {
+        notices.push(t('panel.provider.switchPending'))
+      }
+      if (notices.length > 0) {
+        setProviderNotice(notices.join(' '))
+      }
+    } catch (err) {
+      setTestResult(err instanceof Error ? err.message : String(err))
+    } finally {
+      // 热重载是异步落位（宿主端点内已等待到位），刷新拿到最终状态
+      await refreshProviderStatus()
+      await refreshCredential()
+      setSwitching(false)
+    }
+  }
+
+  const refreshCredential = useCallback(async (): Promise<PanelCredential | undefined> => {
+    try {
+      const value = await callPanel<{ credential: PanelCredential }>(connection, 'overview')
+      setCredential(value.credential)
+      return value.credential
+    } catch {
+      setCredential(undefined)
+      return undefined
+    }
+  }, [connection])
+
+  useEffect(() => {
+    void refreshCredential()
+  }, [refreshCredential])
+
+  /** 写入（覆盖）或清除存储中的密钥；成功后清空草稿并刷新状态。 */
+  const applyKey = async (endpoint: 'credential/set' | 'credential/unset') => {
+    setKeyBusy(true)
+    setKeyNotice(null)
+    try {
+      const payload = endpoint === 'credential/set' ? { value: keyDraft } : {}
+      const result = await callPanel<{ credential: PanelCredential }>(connection, endpoint, payload)
+      setCredential(result.credential)
+      setKeyDraft('')
+      setKeyNotice({
+        kind: 'ok',
+        text:
+          endpoint === 'credential/set'
+            ? t('panel.credential.savedNotice')
+            : t('panel.credential.clearedNotice', { credential: credentialName }),
+      })
+    } catch (err) {
+      setKeyNotice({ kind: 'error', text: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setKeyBusy(false)
+    }
+  }
+
+  const runTest = async () => {
+    setTesting(true)
+    setTestResult(null)
+    try {
+      // 宿主只回机器可判的 reason + 原始 detail，用户可见文案由本端按语言渲染
+      const result = await callPanel<{
+        ok: boolean
+        reason?: string
+        detail?: string
+      }>(connection, 'test-connection')
+      setTestResult(
+        result.ok
+          ? t('panel.test.ok')
+          : result.reason === 'missing-key'
+            ? t('panel.test.missingKey', { credential: credentialName })
+            : result.reason === 'invalid-key'
+              ? t('panel.test.invalidKey', { credential: credentialName })
+              : result.reason === 'unknown'
+                ? t('panel.test.unknown', { detail: result.detail ?? '' })
+                : t('panel.test.gatewayFail', { detail: result.detail ?? '' }),
+      )
+    } catch (err) {
+      setTestResult(err instanceof Error ? err.message : String(err))
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  /** 保存网关地址（仅 openai-compat）：宿主写用户层补丁 config 节并热重载落位，
+   *  与切换提供方同款「几秒落位」体验；pending 语义同切换。 */
+  const saveBaseUrl = async () => {
+    const normalized = normalizeBaseUrl(baseUrlDraft ?? effectiveBaseUrl)
+    if (!normalized.valid) {
+      setBaseUrlNotice({ kind: 'error', text: t('panel.connection.invalid') })
+      return
+    }
+    const raw = normalized.value
+    setBaseUrlBusy(true)
+    setBaseUrlNotice(null)
+    try {
+      const result = await callPanel<{ pending?: boolean }>(connection, 'provider/baseurl/set', {
+        baseUrl: raw,
+      })
+      setBaseUrlDraft(raw)
+      setBaseUrlNotice(
+        result.pending === true
+          ? { kind: 'ok', text: t('panel.connection.pending') }
+          : { kind: 'ok', text: t('panel.connection.saved') },
+      )
+    } catch (err) {
+      setBaseUrlNotice({ kind: 'error', text: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setBaseUrlBusy(false)
+      await refreshProviderStatus()
+    }
+  }
+
+  // 模型发现（仅 openai-compat 有意义）：拉取网关 /v1/models 建议合并静态候选；
+  // 未配置/网络错/HTML-200/非 openai-compat 一律由宿主降级为空列表——静默回退
+  // 静态 hints + 手填，绝不弹错（建议是锦上添花，不阻塞配置）。
+  // 依赖含 effectiveBaseUrl：首次在连接卡填地址并保存后 providerId 不变，但生效
+  // 地址已变，重新拉取才能拿到网关建议；地址为空/非 openai-compat 时宿主仍降级，多调无副作用。
+  const [fetchedModels, setFetchedModels] = useState<string[]>([])
+  useEffect(() => {
+    let alive = true
+    setOpenModelTier(null)
+    setFetchedModels([])
+    void callPanel<{ models?: string[] }>(connection, 'provider/models')
+      .then((value) => {
+        if (alive && Array.isArray(value.models)) setFetchedModels(value.models)
+      })
+      .catch(() => undefined)
+    return () => {
+      alive = false
+    }
+  }, [connection, providerId, effectiveBaseUrl])
+
+  /** 下拉建议 = 注册表静态候选 ∪ 网关拉取建议（去重排序；空串「跟随默认」不进建议）。 */
+  const suggestionsOf = (tier: 'wireframe' | 'highFidelity' | 'draft'): string[] =>
+    [...new Set([...activeMeta.hints[tier].filter(Boolean), ...fetchedModels])].sort()
+
+  const sourceLabel = sourceLabelText(t, credential?.source)
+
+  const credentialLine =
+    credential === undefined
+      ? t('panel.credential.checking')
+      : credential.configured
+        ? sourceLabel === undefined
+          ? t('panel.credential.ready')
+          : t('panel.credential.readyWithSource', { source: sourceLabel })
+        : t('panel.credential.missing', { credential: credentialName })
+
+  const needsBaseUrl = providerId === 'openai-compat'
+  const connectionReady =
+    credential?.configured === true && (!needsBaseUrl || effectiveBaseUrl !== '')
+  const connectionStatus =
+    credential === undefined
+      ? t('panel.connection.checkingStatus')
+      : connectionReady
+        ? t('panel.connection.readyStatus')
+        : t('panel.connection.incompleteStatus')
+  const modelTiers = [
+    {
+      key: 'wireframe' as const,
+      pref: 'wireframeModel',
+      label: t('panel.models.wireframe'),
+      menuLabel: t('panel.models.options', { label: t('panel.models.wireframe') }),
+      visibleLabel: t('panel.models.wireframe'),
+      value: snap.value?.wireframeModel ?? '',
+    },
+    {
+      key: 'highFidelity' as const,
+      pref: 'highFidelityModel',
+      label: t('panel.models.highFidelity'),
+      menuLabel: t('panel.models.options', { label: t('panel.models.highFidelity') }),
+      visibleLabel: t('panel.models.highFidelity'),
+      value: snap.value?.highFidelityModel ?? '',
+    },
+    {
+      key: 'draft' as const,
+      pref: 'draftModel',
+      label: t('panel.models.draft'),
+      menuLabel: t('panel.models.options', { label: t('panel.models.draft') }),
+      visibleLabel: t('panel.models.draftShort'),
+      value: snap.value?.draftModel ?? '',
+    },
+  ]
+
+  return (
+    <div className="ui-mockup-provider-page">
+      {snap.mode === 'memory' || !snap.writable ? (
+        <Notice>{t('panel.readonlyBanner')}</Notice>
+      ) : null}
+      {writeError !== '' && <Notice danger>{writeError}</Notice>}
+
+      <ConfigSection
+        title={t('panel.provider.title')}
+        description={t('panel.provider.description')}
+      >
+        {/* 提供方卡可点击切换：宿主端点改写 home 用户层 patch（DSH 热重载即时生效），
+            面板不直接写 bundle 层——组合行仍是唯一事实源，这里只是代写它。 */}
+        {statusUnknown && <Notice>{t('panel.provider.unknownHint')}</Notice>}
+        {providerNotice !== null && <Notice>{providerNotice}</Notice>}
+        <div
+          role="radiogroup"
+          aria-label={t('panel.provider.title')}
+          aria-busy={switching}
+          className="ui-mockup-provider-grid"
+        >
+          {PROVIDER_REGISTRY.map((meta) => {
+            // 端点不可达（unknown）时按安装默认渲染默认提供方为选中，并标明「默认生效」
+            const isFallbackActive =
+              statusUnknown && providerId === 'unknown' && meta.id === DEFAULT_PROVIDER_ID
+            const active = providerId === meta.id || isFallbackActive
+            return (
+              <label
+                key={meta.id}
+                className="ui-mockup-provider-card"
+                data-active={active}
+                data-disabled={switching}
+                onClick={() => {
+                  if (!active) void switchProvider(meta.id)
+                }}
+              >
+                <input
+                  type="radio"
+                  name="ui-mockup-provider"
+                  checked={active}
+                  disabled={switching}
+                  readOnly
+                  aria-label={t(meta.nameKey)}
+                />
+                <strong className="ui-mockup-provider-name">{t(meta.nameKey)}</strong>
+                {active && (
+                  <span className="ui-mockup-provider-badge">
+                    {isFallbackActive
+                      ? t('panel.provider.fallbackActive')
+                      : t('panel.provider.current')}
+                  </span>
+                )}
+              </label>
+            )
+          })}
+        </div>
+      </ConfigSection>
+
+      <ConfigSection
+        title={t('panel.connection.title')}
+        aside={
+          <>
+            <span className="ui-mockup-connection-status">
+              <StatusDot
+                ok={connectionReady}
+                busy={credential === undefined || testing || baseUrlBusy || keyBusy}
+              />
+              {connectionStatus}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void runTest()}
+              disabled={testing || (providerId === 'openai-compat' && effectiveBaseUrl === '')}
+            >
+              {testing ? t('panel.testing') : t('panel.testConnection')}
+            </Button>
+          </>
+        }
+      >
+        {/* OpenAI 兼容网关额外需要 baseUrl；其余提供方只显示凭据行。 */}
+        {providerId === 'openai-compat' && (
+          <div className="ui-mockup-connection-row">
+            <label htmlFor={baseUrlInputId} className="ui-mockup-connection-label">
+              {t('panel.connection.baseUrlShortLabel')}
+            </label>
+            <div className="ui-mockup-connection-field">
+              <div className="ui-mockup-connection-control">
+                <Input
+                  id={baseUrlInputId}
+                  type="text"
+                  aria-label={t('panel.connection.baseUrlLabel')}
+                  style={{ flex: '1 1 240px', minWidth: 0 }}
+                  value={baseUrlDraft ?? effectiveBaseUrl}
+                  placeholder={t('panel.connection.baseUrlPlaceholder')}
+                  autoComplete="off"
+                  onChange={(event) => setBaseUrlDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') void saveBaseUrl()
+                  }}
+                />
+                <Button
+                  variant="primary"
+                  size="sm"
+                  aria-label={t('panel.connection.save')}
+                  disabled={
+                    baseUrlBusy ||
+                    (baseUrlDraft ?? effectiveBaseUrl).trim() === effectiveBaseUrl.trim()
+                  }
+                  onClick={() => void saveBaseUrl()}
+                >
+                  {t('panel.action.save')}
+                </Button>
+              </div>
+              <Notice>{t('panel.connection.baseUrlHint')}</Notice>
+              {baseUrlNotice !== null && (
+                <Notice danger={baseUrlNotice.kind === 'error'}>{baseUrlNotice.text}</Notice>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="ui-mockup-connection-row">
+          <label htmlFor={credentialInputId} className="ui-mockup-connection-label">
+            {t('panel.connection.apiKeyLabel')}
+          </label>
+          <div className="ui-mockup-connection-field">
+            {credential?.writable === true ? (
+              <div className="ui-mockup-connection-control">
+                <Input
+                  id={credentialInputId}
+                  type="password"
+                  aria-label={t('panel.credential.keyInputLabel', { credential: credentialName })}
+                  style={{ flex: '1 1 220px', minWidth: 0 }}
+                  value={keyDraft}
+                  autoComplete="off"
+                  placeholder={t('panel.credential.writePlaceholder', {
+                    credential: credentialName,
+                  })}
+                  onChange={(event) => setKeyDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && keyDraft.trim() !== '') {
+                      void applyKey('credential/set')
+                    }
+                  }}
+                />
+                <Button
+                  variant="primary"
+                  size="sm"
+                  aria-label={t('panel.credential.save')}
+                  disabled={keyBusy || keyDraft.trim() === ''}
+                  onClick={() => void applyKey('credential/set')}
+                >
+                  {t('panel.action.save')}
+                </Button>
+                {credential.configured && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={keyBusy}
+                    onClick={() => void applyKey('credential/unset')}
+                  >
+                    {t('panel.credential.clear')}
+                  </Button>
+                )}
+              </div>
+            ) : credential !== undefined && credential.configured ? (
+              <Notice>{t('panel.credential.notWritable', { source: sourceLabel ?? '' })}</Notice>
+            ) : null}
+            <span className="ui-mockup-credential-status">
+              <StatusDot ok={credential?.configured === true} />
+              {credentialLine}
+            </span>
+            {keyNotice !== null && (
+              <Notice danger={keyNotice.kind === 'error'}>{keyNotice.text}</Notice>
+            )}
+          </div>
+        </div>
+
+        {testResult !== null && <Notice>{testResult}</Notice>}
+        <details className="ui-mockup-connection-details">
+          <summary>{t('panel.connection.moreMethods')}</summary>
+          <div className="ui-mockup-connection-methods">
+            <span>{t('panel.credential.howTitle')}</span>
+            <ol>
+              <li>{t('panel.credential.way1', { credential: credentialName })}</li>
+              <li>{t('panel.credential.way2')}</li>
+              <li>{t('panel.credential.way3', { credential: credentialName })}</li>
+              <li>{t('panel.credential.way4', { credential: credentialName })}</li>
+            </ol>
+          </div>
+        </details>
+      </ConfigSection>
+
+      <ConfigSection title={t('panel.models.title')} description={t('panel.models.description')}>
+        {/* 可编辑组合框：输入框保留任意模型名手填能力，候选弹层统一复用 DSH Menu。 */}
+        <div className="ui-mockup-model-grid">
+          {modelTiers.map((tier) => (
+            <div key={tier.key} className="ui-mockup-model-field">
+              <span className="ui-mockup-model-label">{tier.visibleLabel}</span>
+              <EditableMenuCombobox
+                label={tier.label}
+                menuLabel={tier.menuLabel}
+                value={tier.value}
+                placeholder={t('panel.models.followDefault')}
+                options={suggestionsOf(tier.key)}
+                open={openModelTier === tier.key}
+                onOpenChange={(open) => setOpenModelTier(open ? tier.key : null)}
+                onChange={(value) => void writePref(prefs, tier.pref, value.trim(), setWriteError)}
+                disabled={snap.mode === 'memory' || !snap.writable}
+              />
+              <span className="ui-mockup-model-hint">
+                {t('panel.models.recommended', {
+                  models:
+                    activeMeta.hints[tier.key].find((model) => model !== '') ??
+                    t('panel.models.followDefault'),
+                })}
+              </span>
+            </div>
+          ))}
+        </div>
+      </ConfigSection>
+    </div>
+  )
+}
+
+/* ---------------- 生成偏好 ---------------- */
+
+const EDITABLE_PREF_FIELDS = [
+  'defaultFidelity',
+  'defaultPlatform',
+  'defaultCount',
+  'pollTimeoutMinutes',
+  'defaultSize',
+] as const
+
+/** 只比较本页可编辑字段；Provider 模型偏好不应影响本页保存按钮。 */
+function editablePrefsEqual(left: PanelPrefs, right: PanelPrefs): boolean {
+  return (
+    left.defaultFidelity === right.defaultFidelity &&
+    left.defaultPlatform === right.defaultPlatform &&
+    left.defaultCount === right.defaultCount &&
+    left.pollTimeoutMinutes === right.pollTimeoutMinutes &&
+    left.defaultSize === right.defaultSize
+  )
+}
+
+/** unset 成功以用户层字段消失为准；resolved value 可以来自自定义 composition base。 */
+function editableUserOverridesCleared(user: unknown): boolean {
+  if (user === undefined) return true
+  if (typeof user !== 'object' || user === null || Array.isArray(user)) return false
+  return EDITABLE_PREF_FIELDS.every((field) => !Object.prototype.hasOwnProperty.call(user, field))
+}
+
+function PreferencesPage({ t, prefs }: Omit<PanelProps, 'connection'>) {
+  const snap = prefs.getSnapshot()
+  usePrefSync(prefs)
+  const initial = useMemo(() => snap.value ?? PANEL_DEFAULTS, [snap.value])
+  const [draft, setDraft] = useState<PanelPrefs>(initial)
+  const [baseline, setBaseline] = useState<PanelPrefs>(initial)
+  const [savedAt, setSavedAt] = useState(0)
+  const [error, setError] = useState('')
+  const [mutating, setMutating] = useState(false)
+  const mutationLock = useRef(false)
+  const dirty = !editablePrefsEqual(draft, baseline)
+
+  useEffect(() => {
+    // 外部值到达/变化且本地没有未保存修改时回填草稿；避免覆盖正在编辑的内容
+    if (!dirty && !mutating && snap.value !== undefined) {
+      setDraft(snap.value)
+      setBaseline(snap.value)
+    }
+  }, [dirty, mutating, snap.value])
+
+  const patch = (part: Partial<PanelPrefs>) => {
+    if (mutationLock.current) return
+    setDraft((prev) => ({ ...prev, ...part }))
+  }
+
+  const beginMutation = (): boolean => {
+    if (mutationLock.current) return false
+    mutationLock.current = true
+    setMutating(true)
+    setSavedAt(0)
+    setError('')
+    return true
+  }
+
+  const endMutation = () => {
+    mutationLock.current = false
+    setMutating(false)
+  }
+
+  const confirmApplied = (expected: PanelPrefs): PanelPrefs => {
+    const actual = prefs.getSnapshot().value
+    if (actual === undefined || !editablePrefsEqual(actual, expected)) {
+      throw new Error(t('panel.prefs.writeNotApplied'))
+    }
+    return actual
+  }
+
+  /** 单字段写入后立即确认落盘；宿主 set 失败时静默恢复（不抛错），逐字段确认
+      能在第一时间中止后续写入，避免静默部分落盘。 */
+  const setField = async (field: (typeof EDITABLE_PREF_FIELDS)[number], value: unknown) => {
+    await prefs.set(field, value)
+    const actual = prefs.getSnapshot().value
+    if (actual === undefined || actual[field] !== value) {
+      throw new Error(t('panel.prefs.writeNotAppliedField', { field }))
+    }
+  }
+
+  const confirmResetApplied = (): PanelPrefs => {
+    const current = prefs.getSnapshot()
+    if (current.value === undefined || !editableUserOverridesCleared(current.user)) {
+      throw new Error(t('panel.prefs.writeNotApplied'))
+    }
+    return current.value
+  }
+
+  const save = async () => {
+    if (!beginMutation()) return
+    try {
+      const saved = {
+        ...draft,
+        defaultCount: Math.min(4, Math.max(1, Math.round(draft.defaultCount))),
+        pollTimeoutMinutes: Math.max(1, Math.round(draft.pollTimeoutMinutes)),
+      }
+      await setField('defaultFidelity', saved.defaultFidelity)
+      await setField('defaultPlatform', saved.defaultPlatform)
+      await setField('defaultCount', saved.defaultCount)
+      await setField('pollTimeoutMinutes', saved.pollTimeoutMinutes)
+      await setField('defaultSize', saved.defaultSize)
+      const applied = confirmApplied(saved)
+      setDraft(applied)
+      setBaseline(applied)
+      setSavedAt(Date.now())
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      endMutation()
+    }
+  }
+
+  const resetDefaults = async () => {
+    if (!beginMutation()) return
+    try {
+      for (const field of EDITABLE_PREF_FIELDS) {
+        await prefs.unset(field)
+      }
+      const applied = confirmResetApplied()
+      setDraft(applied)
+      setBaseline(applied)
+      setSavedAt(Date.now())
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      endMutation()
+    }
+  }
+
+  const readonlyNote = snap.mode === 'memory' || !snap.writable
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {readonlyNote && <Notice>{t('panel.readonlyBanner')}</Notice>}
+      {error !== '' && <Notice danger>{error}</Notice>}
+      <Card>
+        <FieldRow first label={t('panel.prefs.fidelity')}>
+          <Radio
+            label={t('panel.prefs.fidelityWireframe')}
+            checked={draft.defaultFidelity === 'wireframe'}
+            onChange={() => patch({ defaultFidelity: 'wireframe' })}
+            name="pref-fidelity"
+            disabled={readonlyNote || mutating}
+          />
+          <Radio
+            label={t('panel.prefs.fidelityHigh')}
+            checked={draft.defaultFidelity === 'high-fidelity'}
+            onChange={() => patch({ defaultFidelity: 'high-fidelity' })}
+            name="pref-fidelity"
+            disabled={readonlyNote || mutating}
+          />
+        </FieldRow>
+        <FieldRow label={t('panel.prefs.platform')}>
+          <Radio
+            label="Web"
+            checked={draft.defaultPlatform === 'web'}
+            onChange={() => patch({ defaultPlatform: 'web' })}
+            name="pref-platform"
+            disabled={readonlyNote || mutating}
+          />
+          <Radio
+            label="Mobile"
+            checked={draft.defaultPlatform === 'mobile'}
+            onChange={() => patch({ defaultPlatform: 'mobile' })}
+            name="pref-platform"
+            disabled={readonlyNote || mutating}
+          />
+        </FieldRow>
+        <FieldRow label={t('panel.prefs.count')}>
+          {[1, 2, 3, 4].map((n) => (
+            <Radio
+              key={n}
+              label={String(n)}
+              checked={draft.defaultCount === n}
+              onChange={() => patch({ defaultCount: n })}
+              name="pref-count"
+              disabled={readonlyNote || mutating}
+            />
+          ))}
+        </FieldRow>
+        {/* 输出目录已由设计资产库接管($DSH_HOME/mockups/<工作区>/images)，不再可配 */}
+        <FieldRow label={t('panel.prefs.pollTimeout')}>
+          <Input
+            type="number"
+            aria-label={t('panel.prefs.pollTimeout')}
+            min={1}
+            max={60}
+            style={{ width: 100 }}
+            value={draft.pollTimeoutMinutes}
+            onChange={(event) => patch({ pollTimeoutMinutes: Number(event.target.value) })}
+            disabled={readonlyNote || mutating}
+          />
+          <span style={{ fontSize: 12, color: tokens.labelTertiary }}>
+            {t('panel.prefs.minutes')}
+          </span>
+        </FieldRow>
+        <FieldRow label={t('panel.prefs.backoff')}>
+          <span style={{ fontSize: 13, lineHeight: '20px', color: tokens.labelTertiary }}>
+            {t('panel.prefs.backoffFixed')}
+          </span>
+        </FieldRow>
+        <FieldRow label={t('panel.prefs.size')}>
+          <MenuSelect
+            label={t('panel.prefs.size')}
+            value={draft.defaultSize}
+            options={[
+              { value: '', label: t('panel.models.followDefault') },
+              { value: '1024*1024', label: '1024*1024' },
+              { value: '1280*720', label: '1280*720' },
+              { value: '720*1280', label: '720*1280' },
+            ]}
+            onChange={(value) => patch({ defaultSize: value })}
+            disabled={readonlyNote || mutating}
+          />
+        </FieldRow>
+      </Card>
+      <div
+        className="ui-mockup-preferences-footer"
+        style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+      >
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => void resetDefaults()}
+          disabled={readonlyNote || mutating}
+        >
+          {t('panel.prefs.reset')}
+        </Button>
+        <div
+          className="ui-mockup-preferences-actions"
+          style={{ display: 'flex', gap: 10, alignItems: 'center' }}
+        >
+          {savedAt > 0 && !dirty && (
+            <span
+              role="status"
+              aria-live="polite"
+              style={{ fontSize: 12, color: tokens.labelTertiary }}
+            >
+              {t('panel.prefs.saved')}
+            </span>
+          )}
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => void save()}
+            disabled={readonlyNote || mutating || !dirty}
+          >
+            {t('panel.prefs.save')}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ---------------- 生成历史 ---------------- */
+
+interface HistoryRow extends Record<string, unknown> {
+  time: string
+  description: string
+  files: string[]
+  model?: string
+  fidelity?: string
+  platform?: string
+  size?: string
+  anchored: boolean
+  /** 方向稿标记（0.2.0 起，旧行缺字段为 undefined）。 */
+  fastPreview?: boolean
+}
+
+function HistoryPage({ t, connection }: Omit<PanelProps, 'prefs'>) {
+  // 客户端第三方插件拿不到会话服务（ctx.get('sessions') 恒 undefined），
+  // 历史/缩略图/锚点请求一律不传 cwd，由宿主按「会话 cwd → 最近登记根 → 进程根」
+  // 回退链解析工作区——这是已验证有效的唯一路径。
+  const cwd: string | undefined = undefined
+  const [rows, setRows] = useState<HistoryRow[]>()
+  const [anchorFile, setAnchorFile] = useState<string | null>(null)
+  const [anchorIndex, setAnchorIndex] = useState(-1)
+  const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
+  const [queryDraft, setQueryDraft] = useState('')
+  const [appliedQuery, setAppliedQuery] = useState('')
+  // 「只看方向稿」过滤位：纯增量参数，宿主端服务端过滤后再分页
+  const [draftOnly, setDraftOnly] = useState(false)
+  const [error, setError] = useState('')
+  const [confirmingClear, setConfirmingClear] = useState(false)
+  // 并发防护：连续翻页/搜索时多个 history/list 在飞，单调序号丢弃过期响应，
+  // 避免晚到的旧响应覆盖新页码（页码高亮与内容错位）
+  const requestSeq = useRef(0)
+
+  // 服务端分页：宿主按 page/pageSize 切片返回当前页 + total + 锚点索引；
+  // 页码越界由宿主钳制后回传 data.page，客户端直接采用，无需本地 clamp。
+  const reload = useCallback(
+    async (needle: string, targetPage: number, onlyDraft: boolean) => {
+      const seq = ++requestSeq.current
+      setError('')
+      try {
+        const data = await callPanel<{
+          anchorFile: string | null
+          anchorIndex: number
+          total: number
+          page: number
+          pageSize: number
+          entries: HistoryRow[]
+        }>(connection, 'history/list', {
+          cwd,
+          query: needle,
+          page: targetPage,
+          pageSize: HISTORY_PAGE_SIZE,
+          ...(onlyDraft ? { draftOnly: true } : {}),
+        })
+        if (seq !== requestSeq.current) return
+        setRows(data.entries)
+        setAnchorFile(data.anchorFile)
+        setAnchorIndex(data.anchorIndex)
+        setTotal(data.total)
+        setPage(data.page)
+      } catch (err) {
+        if (seq !== requestSeq.current) return
+        setError(err instanceof Error ? err.message : String(err))
+      }
+    },
+    [connection, cwd],
+  )
+
+  useEffect(() => {
+    // 工作区/连接变化后拉的是全量未过滤列表，过滤位必须一并复位：
+    // 否则「只看方向稿」仍显示为勾选，但列表已是全量数据，
+    // 后续翻页又会重新带上 draftOnly，造成 total/page 与内容错位。
+    setDraftOnly(false)
+    void reload('', 1, false)
+    // 列表仅在 cwd/连接变化(reload 标识)时自动重载；搜索/翻页/过滤由交互显式触发。
+  }, [reload])
+
+  const submitSearch = () => {
+    setAppliedQuery(queryDraft)
+    void reload(queryDraft, 1, draftOnly)
+  }
+
+  const toggleDraftOnly = (next: boolean) => {
+    setDraftOnly(next)
+    void reload(appliedQuery, 1, next)
+  }
+
+  const totalPages = Math.max(1, Math.ceil(total / HISTORY_PAGE_SIZE))
+  const anchorPage = anchorPageOf(anchorIndex, HISTORY_PAGE_SIZE)
+
+  const act = async (endpoint: string, payload: Record<string, unknown>, stayPage = page) => {
+    try {
+      await callPanel(connection, endpoint, payload)
+      await reload(appliedQuery, stayPage, draftOnly)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  if (error !== '') return <Notice danger>{t('panel.loadFailed', { error })}</Notice>
+  if (rows === undefined)
+    return <div style={{ color: tokens.labelTertiary }}>{t('panel.loading')}</div>
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div
+        role="search"
+        aria-label={t('panel.history.searchLabel')}
+        className="ui-mockup-history-toolbar"
+        style={{ display: 'flex', gap: 8 }}
+      >
+        <Input
+          type="search"
+          aria-label={t('panel.history.searchLabel')}
+          className="ui-mockup-history-search"
+          placeholder={t('panel.history.searchPlaceholder')}
+          value={queryDraft}
+          onChange={(event) => setQueryDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== 'Enter') return
+            event.preventDefault()
+            submitSearch()
+          }}
+        />
+        <Button variant="outline" size="sm" onClick={submitSearch}>
+          {t('panel.history.search')}
+        </Button>
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            fontSize: 12,
+            color: tokens.labelSecondary,
+            whiteSpace: 'nowrap',
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={draftOnly}
+            onChange={(event) => toggleDraftOnly(event.target.checked)}
+          />
+          {t('panel.history.draftOnly')}
+        </label>
+        {/* 两段确认拆为确认/取消双按钮：同按钮 onBlur 重置会让键盘用户
+            Tab 离开时意外丢失确认态，双按钮语义明确且无障碍友好 */}
+        {confirmingClear ? (
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() =>
+                void act('history/clear', { cwd }, 1).finally(() => setConfirmingClear(false))
+              }
+              style={{ color: tokens.labelError, borderColor: tokens.labelError }}
+            >
+              {t('panel.history.confirmClear')}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => setConfirmingClear(false)}>
+              {t('panel.history.cancelClear')}
+            </Button>
+          </>
+        ) : (
+          <Button variant="ghost" size="sm" onClick={() => setConfirmingClear(true)}>
+            {t('panel.history.clear')}
+          </Button>
+        )}
+      </div>
+      {queryDraft !== appliedQuery && (
+        <span
+          role="status"
+          aria-live="polite"
+          style={{ fontSize: 12, lineHeight: '17px', color: tokens.labelTertiary }}
+        >
+          {t('panel.history.pendingSearch')}
+        </span>
+      )}
+
+      {rows.length === 0 && (
+        <div
+          style={{
+            color: tokens.labelTertiary,
+            fontSize: 13,
+            lineHeight: '20px',
+            padding: '18px 0',
+            textAlign: 'center',
+          }}
+        >
+          {t('panel.history.empty')}
+        </div>
+      )}
+
+      {rows.map((row, index) => {
+        const first = row.files[0]
+        const name = first === undefined ? '' : (first.split('/').pop() ?? '')
+        return (
+          /* 已确认线框：横向卡片行；锚点行整行边框加粗 + 右上角旗标徽标。
+             key 用 time+首图文件名：同秒多条 / 翻页过滤后 index 会错位，不能作 key */
+          <div
+            key={`${row.time}:${row.files[0] ?? index}`}
+            className="ui-mockup-history-row"
+            style={{
+              display: 'flex',
+              gap: 10,
+              alignItems: 'center',
+              border: `${row.anchored ? 2 : 1}px solid ${tokens.border}`,
+              borderRadius: 8,
+              padding: 8,
+              position: 'relative',
+            }}
+          >
+            {row.anchored && (
+              <span
+                style={{
+                  position: 'absolute',
+                  top: -9,
+                  right: 10,
+                  background: 'var(--dsw-alias-bg-module-platform)',
+                  borderRadius: 999,
+                  fontSize: 11,
+                  lineHeight: '17px',
+                  padding: '1px 8px',
+                  fontWeight: 500,
+                  color: tokens.labelSecondary,
+                }}
+              >
+                🚩 {t('panel.history.anchorTag')}
+              </span>
+            )}
+            {name !== '' && (
+              <img
+                src={imageUrl(name, cwd)}
+                alt={name}
+                loading="lazy"
+                width={56}
+                height={56}
+                style={{
+                  borderRadius: 8,
+                  border: `1px solid ${tokens.border}`,
+                  objectFit: 'cover',
+                  background: tokens.bgLayer,
+                  flexShrink: 0,
+                }}
+              />
+            )}
+            <div
+              className="ui-mockup-history-summary"
+              style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 2 }}
+            >
+              <div
+                style={{
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  fontSize: 13,
+                  lineHeight: '20px',
+                  fontWeight: row.anchored ? 600 : 400,
+                }}
+              >
+                {row.description}
+              </div>
+              <div style={{ fontSize: 12, lineHeight: '17px', color: tokens.labelTertiary }}>
+                {formatTime(row.time)} · {row.model ?? '—'} · {row.size ?? '—'} ·{' '}
+                {t('panel.history.fileCount', { n: row.files.length })}
+                {row.fastPreview === true && (
+                  <span
+                    style={{
+                      marginLeft: 6,
+                      padding: '0 6px',
+                      borderRadius: 999,
+                      fontSize: 11,
+                      background: 'var(--dsw-alias-bg-module-platform)',
+                      color: tokens.labelSecondary,
+                    }}
+                  >
+                    {t('panel.history.draftTag')}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div
+              className="ui-mockup-history-actions"
+              style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}
+            >
+              {/* 设锚入口在对话卡片（点哪张设哪张）；历史页只保留解除与查看 */}
+              {row.anchored && (
+                <Button variant="ghost" size="sm" onClick={() => void act('anchor/unset', { cwd })}>
+                  {t('panel.history.unsetAnchor')}
+                </Button>
+              )}
+              {name !== '' && (
+                <a href={imageUrl(name, cwd)} target="_blank" rel="noreferrer">
+                  <Button variant="outline" size="sm">
+                    {t('card.openOriginal')}
+                  </Button>
+                </a>
+              )}
+            </div>
+          </div>
+        )
+      })}
+      {anchorPage !== null && anchorPage !== page && (
+        <div
+          className="ui-mockup-history-anchor-nav"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            fontSize: 12,
+            lineHeight: '17px',
+            color: tokens.labelSecondary,
+          }}
+        >
+          <span>🚩 {t('panel.history.anchorOnPage', { n: anchorPage })}</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void reload(appliedQuery, anchorPage, draftOnly)}
+          >
+            {t('panel.history.goToAnchor')}
+          </Button>
+        </div>
+      )}
+
+      <div
+        className="ui-mockup-history-pagination"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          gap: 8,
+          flexWrap: 'wrap',
+        }}
+      >
+        <span style={{ fontSize: 12, color: tokens.labelTertiary }}>
+          {t('panel.history.totalCount', { n: total })}
+        </span>
+        {totalPages > 1 && (
+          <div
+            className="ui-mockup-history-pages"
+            style={{ display: 'flex', alignItems: 'center', gap: 4 }}
+          >
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={page <= 1}
+              onClick={() => void reload(appliedQuery, page - 1, draftOnly)}
+            >
+              {t('panel.history.prev')}
+            </Button>
+            {Array.from({ length: totalPages }, (_, i) => i + 1).map((p) => (
+              <Button
+                key={p}
+                variant={p === page ? 'primary' : 'ghost'}
+                size="sm"
+                className="ui-mockup-history-page-number"
+                onClick={() => void reload(appliedQuery, p, draftOnly)}
+              >
+                {p}
+              </Button>
+            ))}
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={page >= totalPages}
+              onClick={() => void reload(appliedQuery, page + 1, draftOnly)}
+            >
+              {t('panel.history.next')}
+            </Button>
+          </div>
+        )}
+      </div>
+
+      {anchorFile !== null && rows.some((r) => r.anchored) && (
+        <Notice>{t('panel.history.anchorHint')}</Notice>
+      )}
+    </div>
+  )
+}
+
+function formatTime(iso: string): string {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return iso
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/* ---------------- 小部件与钩子 ---------------- */
+
+function MenuSelect({
+  label,
+  value,
+  options,
+  onChange,
+  disabled,
+}: {
+  label: string
+  value: string
+  options: ReadonlyArray<{ value: string; label: string }>
+  onChange: (value: string) => void
+  disabled?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const idOf = (optionValue: string) => (optionValue === '' ? '__default__' : optionValue)
+  const selected = options.find((option) => option.value === value)
+  const closeMenu = useCallback(() => setOpen(false), [])
+  useMenuEscapeBoundary(open, closeMenu, triggerRef)
+
+  return (
+    <Menu
+      open={open}
+      onClose={closeMenu}
+      items={options.map((option) => ({ id: idOf(option.value), label: option.label }))}
+      selectedId={idOf(value)}
+      onSelect={(id) => {
+        const option = options.find((entry) => idOf(entry.value) === id)
+        if (option === undefined) return
+        triggerRef.current?.focus()
+        closeMenu()
+        onChange(option.value)
+      }}
+      align="end"
+      portal
+      anchor={
+        <button
+          ref={triggerRef}
+          type="button"
+          className="ui-mockup-select-trigger"
+          aria-label={label}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          disabled={disabled}
+          onClick={() => setOpen((current) => !current)}
+        >
+          <span>{selected?.label ?? value}</span>
+          <IconChevronDownOutline14 className="ui-mockup-select-chevron" />
+        </button>
+      }
+    />
+  )
+}
+
+function EditableMenuCombobox({
+  label,
+  menuLabel,
+  value,
+  placeholder,
+  options,
+  open,
+  onOpenChange,
+  onChange,
+  disabled,
+}: {
+  label: string
+  menuLabel: string
+  value: string
+  placeholder: string
+  options: readonly string[]
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onChange: (value: string) => void
+  disabled?: boolean
+}) {
+  const [activeOptionId, setActiveOptionId] = useState<string | null>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const activeOption =
+    activeOptionId !== null && options.includes(activeOptionId) ? activeOptionId : undefined
+
+  useEffect(() => {
+    if (!open || (activeOptionId !== null && !options.includes(activeOptionId))) {
+      setActiveOptionId(null)
+    }
+  }, [activeOptionId, open, options])
+
+  const closeMenu = useCallback(() => {
+    onOpenChange(false)
+    setActiveOptionId(null)
+  }, [onOpenChange])
+  useMenuEscapeBoundary(open, closeMenu, inputRef)
+
+  const selectOption = (option: string) => {
+    inputRef.current?.focus()
+    closeMenu()
+    onChange(option)
+  }
+
+  return (
+    <Menu
+      open={open && options.length > 0}
+      onClose={closeMenu}
+      items={options.map((option) => ({ id: option, label: option }))}
+      selectedId={activeOption ?? (options.includes(value) ? value : undefined)}
+      onSelect={selectOption}
+      align="start"
+      portal
+      className="ui-mockup-model-menu"
+      anchor={
+        <span className="ui-mockup-model-combobox" data-disabled={disabled === true}>
+          <input
+            ref={inputRef}
+            type="text"
+            role="combobox"
+            aria-label={label}
+            aria-haspopup="menu"
+            aria-expanded={open && options.length > 0}
+            aria-autocomplete="list"
+            value={value}
+            placeholder={placeholder}
+            autoComplete="off"
+            spellCheck={false}
+            disabled={disabled}
+            onFocus={() => onOpenChange(true)}
+            onClick={() => onOpenChange(true)}
+            onChange={(event) => {
+              onOpenChange(true)
+              setActiveOptionId(null)
+              onChange(event.target.value)
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') {
+                closeMenu()
+                return
+              }
+              if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                if (options.length === 0) return
+                event.preventDefault()
+                onOpenChange(true)
+                setActiveOptionId((current) => {
+                  const currentIndex = current === null ? -1 : options.indexOf(current)
+                  if (currentIndex < 0) {
+                    return event.key === 'ArrowDown'
+                      ? (options[0] ?? null)
+                      : (options.at(-1) ?? null)
+                  }
+                  const delta = event.key === 'ArrowDown' ? 1 : -1
+                  return options[(currentIndex + delta + options.length) % options.length] ?? null
+                })
+                return
+              }
+              if (event.key === 'Enter' && open && activeOption !== undefined) {
+                event.preventDefault()
+                selectOption(activeOption)
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="ui-mockup-model-menu-trigger"
+            aria-label={menuLabel}
+            aria-haspopup="menu"
+            aria-expanded={open && options.length > 0}
+            disabled={disabled || options.length === 0}
+            onClick={() => {
+              setActiveOptionId(null)
+              onOpenChange(!open)
+            }}
+          >
+            <IconChevronDownOutline14 />
+          </button>
+        </span>
+      }
+    />
+  )
+}
+
+/**
+ * DSH Menu 与宿主 Modal 都在 document 监听 Esc。菜单打开时由更靠前的捕获阶段
+ * 消费该按键并归还焦点，避免一次 Esc 同时关闭菜单和整个设置弹窗。
+ */
+function useMenuEscapeBoundary(
+  open: boolean,
+  onClose: () => void,
+  returnFocus: RefObject<HTMLElement | null>,
+): void {
+  useEffect(() => {
+    if (!open) return
+    const consumeEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      event.stopImmediatePropagation()
+      returnFocus.current?.focus()
+      onClose()
+    }
+    document.addEventListener('keydown', consumeEscape, true)
+    return () => document.removeEventListener('keydown', consumeEscape, true)
+  }, [open, onClose, returnFocus])
+}
+
+function Radio(props: {
+  label: string
+  checked: boolean
+  onChange: () => void
+  name: string
+  disabled?: boolean
+}) {
+  // 每个选项自带 label 包裹 input：点中文本即选中，屏幕阅读器可正确播报选项标签
+  return (
+    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      <input
+        type="radio"
+        name={props.name}
+        checked={props.checked}
+        disabled={props.disabled}
+        onChange={props.onChange}
+      />
+      {props.label}
+    </label>
+  )
+}
+
+/** 订阅偏好快照使面板随宿主文档变更刷新（写回后镜像更新 → re-render）。 */
+function usePrefSync(prefs: PrefScope<PanelPrefs>): void {
+  const [, bump] = useState(0)
+  useEffect(() => prefs.subscribe(() => bump((n) => n + 1)), [prefs])
+}
+
+/** 单字段写入并显示错误。 */
+async function writePref(
+  prefs: PrefScope<PanelPrefs>,
+  field: string,
+  value: unknown,
+  onError: (message: string) => void,
+): Promise<void> {
+  try {
+    await prefs.set(field, value)
+    onError('')
+  } catch (err) {
+    onError(err instanceof Error ? err.message : String(err))
+  }
+}

@@ -1,0 +1,924 @@
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import type { ComponentProps } from 'react'
+import { UiMockupSection, type PanelPrefs } from '../src/client/settings-panel.js'
+import { en, zh } from '../src/client/locales.js'
+import type {
+  ConnectionFace,
+  PrefScope,
+  RpcResultLike,
+  ScopeSnapshot,
+} from '../src/client/shared.js'
+
+afterEach(cleanup)
+
+const DEFAULT_PREFS: PanelPrefs = {
+  defaultFidelity: 'wireframe',
+  defaultPlatform: 'web',
+  defaultCount: 2,
+  outputDir: 'design/images',
+  pollTimeoutMinutes: 10,
+  wireframeModel: '',
+  highFidelityModel: '',
+  draftModel: '',
+  defaultSize: '',
+}
+
+type Translator = ComponentProps<typeof UiMockupSection>['t']
+
+function translator(locale: typeof zh): Translator {
+  return ((key: keyof typeof zh, params?: Record<string, unknown>) => {
+    let text: string = locale[key]
+    for (const [name, value] of Object.entries(params ?? {})) {
+      text = text.replaceAll(`{${name}}`, String(value))
+    }
+    return text
+  }) as Translator
+}
+
+const t = translator(zh)
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+function createPrefs(
+  initial: PanelPrefs = DEFAULT_PREFS,
+  options: {
+    applyWrites?: boolean
+    base?: PanelPrefs
+    firstWriteGate?: Promise<void>
+    /** 指定字段的 set 静默不生效（模拟宿主写入失败走 recover、resolve 不抛错）。 */
+    failFields?: readonly string[]
+    mode?: 'host' | 'memory'
+    user?: Partial<PanelPrefs>
+    writable?: boolean
+  } = {},
+): PrefScope<PanelPrefs> {
+  const base = options.base ?? initial
+  let user: Partial<PanelPrefs> = { ...options.user }
+  let value = { ...base, ...user }
+  let revision = 1
+  let firstWrite = true
+  const listeners = new Set<() => void>()
+  const snapshot = (): ScopeSnapshot<PanelPrefs> => ({
+    status: 'ready',
+    value,
+    user: Object.keys(user).length === 0 ? undefined : user,
+    base,
+    revision,
+    writable: options.writable ?? true,
+    mode: options.mode ?? 'host',
+  })
+  return {
+    getSnapshot: snapshot,
+    subscribe(listener) {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    set(field, next) {
+      const gate = firstWrite ? options.firstWriteGate : undefined
+      firstWrite = false
+      if (gate !== undefined) return gate.then(() => apply(field, next))
+      return apply(field, next)
+    },
+    unset(field) {
+      if (options.applyWrites === false) return Promise.resolve()
+      const nextUser = { ...user }
+      delete nextUser[field as keyof PanelPrefs]
+      user = nextUser
+      value = { ...base, ...user }
+      revision += 1
+      for (const listener of listeners) listener()
+      return Promise.resolve()
+    },
+  }
+
+  function apply(field: string, next: unknown): Promise<void> {
+    if (options.applyWrites === false) return Promise.resolve()
+    if (options.failFields?.includes(field) === true) return Promise.resolve()
+    user = { ...user, [field]: next }
+    value = { ...base, ...user }
+    revision += 1
+    for (const listener of listeners) listener()
+    return Promise.resolve()
+  }
+}
+
+function createConnection({
+  historyTotal = 0,
+  pendingSwitch = false,
+  pendingLandsBeforeRefresh = false,
+  activeProvider = 'dashscope',
+  baseUrl = '',
+  providerModels,
+}: {
+  historyTotal?: number
+  pendingSwitch?: boolean
+  pendingLandsBeforeRefresh?: boolean
+  activeProvider?: string
+  baseUrl?: string
+  /** 'degraded' = 宿主降级语义；缺省 = 未提供 models 字段的旧宿主形态。 */
+  providerModels?: string[] | 'degraded' | Promise<string[]>
+} = {}) {
+  let switchRequested = false
+  // 生效地址随 provider/baseurl/set 落位而变，模拟宿主热重载后 provider/status 回显新值
+  let currentBaseUrl = baseUrl
+  // 归一化调用日志（去 ui-mockup/ 前缀），供断言读取——call.mock.calls 保留原始带前缀端点
+  const calls: Array<[string, unknown]> = []
+  const call = vi.fn(
+    (
+      _channel: string,
+      rawEndpoint: string,
+      _payload?: unknown,
+    ): Promise<RpcResultLike<unknown>> => {
+      // 0.1.5 起客户端走共享 /api 通道，端点名带 ui-mockup/ 前缀；桩内归一为裸端点名
+      const endpoint = rawEndpoint.replace(/^ui-mockup\//, '')
+      calls.push([endpoint, _payload])
+      if (endpoint === 'provider/models' && providerModels instanceof Promise) {
+        return providerModels.then((models) => ({ ok: true as const, value: { models } }))
+      }
+      if (endpoint === 'provider/switch' && pendingSwitch) switchRequested = true
+      if (endpoint === 'provider/baseurl/set') {
+        const next = (_payload as { baseUrl?: unknown })?.baseUrl
+        if (typeof next === 'string') currentBaseUrl = next
+      }
+      const value =
+        endpoint === 'overview'
+          ? {
+              provider: activeProvider,
+              credential: { configured: true, source: 'file', writable: true },
+              anchor: null,
+            }
+          : endpoint === 'provider/status'
+            ? {
+                active:
+                  switchRequested && pendingLandsBeforeRefresh ? 'volcengine' : activeProvider,
+                baseUrl: currentBaseUrl,
+              }
+            : endpoint === 'provider/switch' && pendingSwitch
+              ? { active: 'dashscope', pending: true }
+              : endpoint === 'provider/models'
+                ? providerModels === 'degraded'
+                  ? { models: [], degraded: true }
+                  : { models: providerModels ?? [] }
+                : endpoint === 'history/list'
+                  ? {
+                      anchorFile: null,
+                      anchorIndex: -1,
+                      total: historyTotal,
+                      page: 1,
+                      pageSize: 5,
+                      entries:
+                        historyTotal === 0
+                          ? []
+                          : [
+                              {
+                                time: '2026-08-31T00:00:00.000Z',
+                                description: '移动端登录页',
+                                files: [],
+                                anchored: false,
+                              },
+                            ],
+                    }
+                  : {}
+      return Promise.resolve({ ok: true as const, value })
+    },
+  )
+  const connection: ConnectionFace = { isLoopback: true, rpc: { call } }
+  return { connection, call, calls }
+}
+
+function mountPanel(
+  options: {
+    historyTotal?: number
+    pendingSwitch?: boolean
+    pendingLandsBeforeRefresh?: boolean
+    prefs?: PrefScope<PanelPrefs>
+    activeProvider?: string
+    baseUrl?: string
+    providerModels?: string[] | 'degraded' | Promise<string[]>
+    translator?: Translator
+  } = {},
+) {
+  const { connection, call, calls } = createConnection(options)
+  const view = render(
+    <UiMockupSection
+      t={options.translator ?? t}
+      prefs={options.prefs ?? createPrefs()}
+      connection={connection}
+    />,
+  )
+  return { ...view, call, calls }
+}
+
+describe('UiMockupSection tabs', () => {
+  it('只让当前 tab 进入 Tab 顺序，并与 tabpanel 双向关联', () => {
+    mountPanel()
+    const tabs = screen.getAllByRole('tab')
+    expect(tabs.map((tab) => tab.tabIndex)).toEqual([0, -1, -1, -1])
+
+    const panel = screen.getByRole('tabpanel')
+    expect(tabs[0]?.getAttribute('aria-controls')).toBe(panel.id)
+    expect(panel.getAttribute('aria-labelledby')).toBe(tabs[0]?.id)
+  })
+
+  it('每个 tab 切换后都与当前 tabpanel 双向关联', () => {
+    mountPanel()
+    for (const tab of screen.getAllByRole('tab')) {
+      fireEvent.click(tab)
+      const panel = screen.getByRole('tabpanel')
+      expect(tab.getAttribute('aria-controls')).toBe(panel.id)
+      expect(panel.getAttribute('aria-labelledby')).toBe(tab.id)
+    }
+  })
+
+  it('用方向键循环切换并支持 Home 和 End', async () => {
+    mountPanel()
+    const overview = screen.getByRole('tab', { name: '概览' })
+
+    fireEvent.keyDown(overview, { key: 'ArrowRight' })
+    const provider = screen.getByRole('tab', { name: '提供方与模型' })
+    expect(provider.getAttribute('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(provider)
+
+    fireEvent.keyDown(provider, { key: 'ArrowLeft' })
+    expect(screen.getByRole('tab', { name: '概览' }).getAttribute('aria-selected')).toBe('true')
+
+    fireEvent.keyDown(screen.getByRole('tab', { name: '概览' }), { key: 'ArrowLeft' })
+    const history = screen.getByRole('tab', { name: '生成历史' })
+    expect(history.getAttribute('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(history)
+
+    fireEvent.keyDown(history, { key: 'Home' })
+    expect(screen.getByRole('tab', { name: '概览' }).getAttribute('aria-selected')).toBe('true')
+
+    fireEvent.keyDown(screen.getByRole('tab', { name: '概览' }), { key: 'End' })
+    fireEvent.keyDown(screen.getByRole('tab', { name: '生成历史' }), { key: 'ArrowRight' })
+    expect(screen.getByRole('tab', { name: '概览' }).getAttribute('aria-selected')).toBe('true')
+
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole('tab', { name: '概览' })),
+    )
+  })
+})
+
+describe('OverviewPage visuals', () => {
+  it('使用稳定的矢量图标而不是系统 Emoji', async () => {
+    const { container } = mountPanel()
+    await screen.findByText('快速使用')
+
+    expect(container.textContent).not.toContain('💬')
+    expect(container.textContent).not.toContain('🖱️')
+    expect(container.textContent).not.toContain('🔒')
+    expect(container.querySelectorAll('svg').length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('长文案只在文本列内换行，不把整段移到图标下方', async () => {
+    mountPanel()
+    const title = await screen.findByText('如何反馈')
+    const step = title.closest<HTMLElement>('.ui-mockup-quick-step')
+    const copy = title.closest<HTMLParagraphElement>('p')
+
+    expect(step?.style.flexWrap).toBe('nowrap')
+    expect(step?.style.alignItems).toBe('flex-start')
+    expect(copy?.style.flex).toBe('1 1 0%')
+    expect(copy?.style.minWidth).toBe('0')
+  })
+})
+
+describe('Provider switch state', () => {
+  it('把三家提供方呈现为一个完整单选组，并明确标出当前使用项', async () => {
+    mountPanel({ activeProvider: 'openai-compat', baseUrl: 'https://gw.test/v1' })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+
+    const providers = await screen.findByRole('radiogroup', { name: '提供方' })
+    expect(within(providers).getAllByRole('radio')).toHaveLength(3)
+    expect(within(providers).getByText('当前使用')).toBeTruthy()
+  })
+
+  it('热重载超时返回 pending 时显示尚未完成提示', async () => {
+    mountPanel({ pendingSwitch: true })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    fireEvent.click(await screen.findByRole('radio', { name: '火山方舟 Volcengine' }))
+
+    expect(
+      await screen.findByText('提供方切换尚未完成；请稍后重试，或检查 DSH 配置与日志。'),
+    ).toBeTruthy()
+    expect(screen.queryByText(/模型分层默认重置/)).toBeNull()
+  })
+
+  it('pending 后刷新发现目标提供方已落位时仍重置旧模型默认值', async () => {
+    const prefs = createPrefs({
+      ...DEFAULT_PREFS,
+      wireframeModel: 'qwen-image-3.0',
+      highFidelityModel: 'qwen-image-3.0-pro',
+    })
+    mountPanel({ pendingSwitch: true, pendingLandsBeforeRefresh: true, prefs })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    fireEvent.click(await screen.findByRole('radio', { name: '火山方舟 Volcengine' }))
+
+    expect(await screen.findByText(/已随切换把模型分层默认重置/)).toBeTruthy()
+    expect(screen.queryByText(/切换尚未完成/)).toBeNull()
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: '线框图' }).value).toBe('')
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: '高保真' }).value).toBe('')
+    expect(
+      screen.getByRole<HTMLSelectElement>('combobox', { name: '方向稿模型（fastPreview）' }).value,
+    ).toBe('')
+  })
+
+  it('把三个档位的推荐模型分别放在对应字段旁，不漏方向稿', async () => {
+    mountPanel()
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const models = await screen.findByRole('region', { name: '模型分层默认' })
+    expect(
+      within(models)
+        .getAllByText(/^推荐：/)
+        .map((node) => node.textContent),
+    ).toEqual(['推荐：qwen-image-3.0', '推荐：qwen-image-3.0-pro', '推荐：qwen-image-3.0'])
+  })
+
+  it('pending 尚未落位时也清除即将失效的旧模型默认值', async () => {
+    const prefs = createPrefs({
+      ...DEFAULT_PREFS,
+      wireframeModel: 'qwen-image-3.0',
+      highFidelityModel: 'qwen-image-3.0-pro',
+    })
+    mountPanel({ pendingSwitch: true, prefs })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    fireEvent.click(await screen.findByRole('radio', { name: '火山方舟 Volcengine' }))
+
+    // 模型已清空但切换未落位：两条提示合并展示，谁也不覆盖谁
+    expect(await screen.findByText(/切换尚未完成/)).toBeTruthy()
+    expect(screen.getByText(/已随切换把模型分层默认重置/)).toBeTruthy()
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: '线框图' }).value).toBe('')
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: '高保真' }).value).toBe('')
+  })
+})
+
+describe('OpenAI 兼容连接配置卡', () => {
+  it('把网关、密钥和连接测试收拢到同一连接区域，并默认折叠其他配置方式', async () => {
+    mountPanel({ activeProvider: 'openai-compat', baseUrl: '' })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+
+    const connection = await screen.findByRole('region', { name: '连接设置' })
+    expect(within(connection).getByLabelText('网关地址 baseUrl')).toBeTruthy()
+    expect(within(connection).getByLabelText('OPENAI_COMPAT_API_KEY 密钥')).toBeTruthy()
+    expect(within(connection).getByRole('button', { name: '测试连接' })).toBeTruthy()
+    const disclosure = within(connection).getByText('其他配置方式').closest('details')
+    expect(disclosure?.open).toBe(false)
+  })
+
+  it('openai-compat 生效时回显生效地址，保存走 provider/baseurl/set', async () => {
+    const { calls } = mountPanel({
+      activeProvider: 'openai-compat',
+      baseUrl: 'https://old-gw.test/v1',
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const input = await screen.findByLabelText<HTMLInputElement>('网关地址 baseUrl')
+    expect(input.value).toBe('https://old-gw.test/v1')
+    // 帮助文案常驻：提示 /v1 习惯与热重载语义
+    expect(screen.getByText(zh['panel.connection.baseUrlHint'])).toBeTruthy()
+
+    fireEvent.change(input, { target: { value: 'https://gw.test/v1/' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存网关地址' }))
+    await waitFor(() => {
+      const hit = calls.find((entry) => entry[0] === 'provider/baseurl/set')
+      expect(hit).toBeDefined()
+      // 客户端先做同款归一：去尾部斜杠再发
+      expect(hit?.[1]).toEqual({ baseUrl: 'https://gw.test/v1' })
+    })
+    expect(await screen.findByText(zh['panel.connection.saved'])).toBeTruthy()
+  })
+
+  it('非法地址在客户端即被拒绝，不发起 RPC', async () => {
+    const { calls } = mountPanel({ activeProvider: 'openai-compat', baseUrl: '' })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const input = await screen.findByLabelText('网关地址 baseUrl')
+    fireEvent.change(input, { target: { value: 'ftp://gw.test' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存网关地址' }))
+    expect(await screen.findByText(zh['panel.connection.invalid'])).toBeTruthy()
+    expect(calls.some((entry) => entry[0] === 'provider/baseurl/set')).toBe(false)
+  })
+
+  it('baseUrl 为空时测试连接置灰，配置地址后恢复可用', async () => {
+    mountPanel({ activeProvider: 'openai-compat', baseUrl: '' })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const test = await screen.findByRole('button', { name: '测试连接' })
+    expect(test.getAttribute('disabled')).not.toBeNull()
+  })
+
+  it('非 openai-compat 提供方不渲染连接配置卡', async () => {
+    mountPanel()
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    await screen.findByRole('radio', { name: '阿里云百炼 DashScope' })
+    expect(screen.queryByLabelText('网关地址 baseUrl')).toBeNull()
+  })
+})
+
+describe('模型发现建议与手填', () => {
+  it('在模型分层区域同时呈现三档可编辑模型', async () => {
+    mountPanel({ activeProvider: 'openai-compat' })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+
+    const models = await screen.findByRole('region', { name: '模型分层默认' })
+    expect(within(models).getByRole('combobox', { name: '线框图' })).toBeTruthy()
+    expect(within(models).getByRole('combobox', { name: '高保真' })).toBeTruthy()
+    expect(within(models).getByRole('combobox', { name: '方向稿模型（fastPreview）' })).toBeTruthy()
+  })
+
+  it('候选合并静态 hints 与网关建议（去重），且永远可手填任意模型名', async () => {
+    mountPanel({
+      activeProvider: 'openai-compat',
+      providerModels: ['gpt-image-2', 'my-gw-model'],
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const input = await screen.findByRole<HTMLInputElement>('combobox', {
+      name: '线框图',
+    })
+    fireEvent.click(input)
+    const options = within(await screen.findByRole('menu'))
+      .getAllByRole('menuitem')
+      .map((option) => option.textContent)
+    // 静态 hint 'gpt-image-2' 与网关同名建议去重；'my-gw-model' 为新增建议
+    expect(options).toEqual(['gpt-image-2', 'my-gw-model'])
+
+    fireEvent.change(input, { target: { value: 'custom-model-x' } })
+    await waitFor(() => expect(input.value).toBe('custom-model-x'))
+  })
+
+  it('模型候选使用 DSH 菜单，选择后立即写入且不保留原生 datalist', async () => {
+    const prefs = createPrefs()
+    const { container } = mountPanel({
+      prefs,
+      activeProvider: 'openai-compat',
+      providerModels: ['gpt-image-2', 'my-gw-model'],
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const input = await screen.findByRole<HTMLInputElement>('combobox', { name: '线框图' })
+
+    expect(input.getAttribute('list')).toBeNull()
+    expect(container.querySelector('datalist')).toBeNull()
+    fireEvent.click(input)
+    const menu = await screen.findByRole('menu')
+    expect(
+      within(menu)
+        .getAllByRole('menuitem')
+        .map((item) => item.textContent),
+    ).toEqual(['gpt-image-2', 'my-gw-model'])
+
+    fireEvent.click(within(menu).getByRole('menuitem', { name: 'my-gw-model' }))
+    await waitFor(() => expect(input.value).toBe('my-gw-model'))
+    expect(prefs.getSnapshot().value?.wireframeModel).toBe('my-gw-model')
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(document.activeElement).toBe(input)
+  })
+
+  it('模型组合框支持方向键选择、Enter 提交与 Esc 关闭', async () => {
+    const prefs = createPrefs()
+    mountPanel({
+      prefs,
+      activeProvider: 'openai-compat',
+      providerModels: ['gpt-image-2', 'my-gw-model'],
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const input = await screen.findByRole<HTMLInputElement>('combobox', { name: '线框图' })
+
+    input.focus()
+    expect(await screen.findByRole('menu')).toBeTruthy()
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(document.activeElement).toBe(input)
+
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(input.value).toBe('my-gw-model'))
+    expect(prefs.getSnapshot().value?.wireframeModel).toBe('my-gw-model')
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(document.activeElement).toBe(input)
+  })
+
+  it('从模型菜单项按 Esc 时关闭菜单并把焦点还给输入框', async () => {
+    mountPanel({ activeProvider: 'openai-compat' })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const input = await screen.findByRole<HTMLInputElement>('combobox', { name: '线框图' })
+
+    fireEvent.click(screen.getByRole('button', { name: '线框图候选' }))
+    const option = await screen.findByRole('menuitem', { name: 'gpt-image-2' })
+    option.focus()
+    fireEvent.keyDown(option, { key: 'Escape' })
+
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(document.activeElement).toBe(input)
+  })
+
+  it('键盘焦点移到下一模型字段时只保留当前候选菜单', async () => {
+    mountPanel({ activeProvider: 'openai-compat' })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const wireframe = await screen.findByRole<HTMLInputElement>('combobox', { name: '线框图' })
+    const highFidelity = screen.getByRole<HTMLInputElement>('combobox', { name: '高保真' })
+
+    act(() => {
+      wireframe.focus()
+    })
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    act(() => {
+      highFidelity.focus()
+    })
+
+    expect(screen.getAllByRole('menu')).toHaveLength(1)
+    expect(document.activeElement).toBe(highFidelity)
+  })
+
+  it('动态候选迟到并改变排序时仍按稳定模型 id 提交活动项', async () => {
+    const models = deferred<string[]>()
+    mountPanel({ activeProvider: 'openai-compat', providerModels: models.promise })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const input = await screen.findByRole<HTMLInputElement>('combobox', { name: '线框图' })
+
+    input.focus()
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    models.resolve(['aaa-model'])
+    expect(await screen.findByRole('menuitem', { name: 'aaa-model' })).toBeTruthy()
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => expect(input.value).toBe('gpt-image-2'))
+  })
+
+  it('英文界面的模型候选按钮使用英文无障碍名称', async () => {
+    mountPanel({ activeProvider: 'openai-compat', translator: translator(en) })
+    fireEvent.click(screen.getByRole('tab', { name: en['panel.tab.provider'] }))
+
+    expect(
+      await screen.findByRole('button', {
+        name: `${en['panel.models.wireframe']} suggestions`,
+      }),
+    ).toBeTruthy()
+  })
+
+  it('保存 baseUrl 后重新拉取模型建议（首次配地址即能拿到网关建议）', async () => {
+    // 初始地址为空→宿主降级；保存后 provider/status 回显新地址，
+    // effect 因 effectiveBaseUrl 变化重跑，再次调 provider/models
+    const { calls } = mountPanel({
+      activeProvider: 'openai-compat',
+      baseUrl: '',
+      providerModels: ['gpt-image-2', 'my-gw-model'],
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const input = await screen.findByLabelText<HTMLInputElement>('网关地址 baseUrl')
+    // 等提供方状态落定后记下现有 provider/models 调用次数（挂载期会多次触发）
+    const modelsCalls = () => calls.filter((entry) => entry[0] === 'provider/models').length
+    await waitFor(() => expect(modelsCalls()).toBeGreaterThanOrEqual(1))
+    const before = modelsCalls()
+
+    fireEvent.change(input, { target: { value: 'https://gw.test/v1' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存网关地址' }))
+    // 保存后 effectiveBaseUrl 变化→effect 重跑→provider/models 再被调用
+    await waitFor(() => expect(modelsCalls()).toBeGreaterThan(before))
+  })
+
+  it('模型拉取降级时静默回退静态候选：无错误提示，手填仍可用', async () => {
+    mountPanel({ activeProvider: 'openai-compat', providerModels: 'degraded' })
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+    const input = await screen.findByRole<HTMLInputElement>('combobox', {
+      name: '线框图',
+    })
+    fireEvent.click(input)
+    const options = within(await screen.findByRole('menu'))
+      .getAllByRole('menuitem')
+      .map((option) => option.textContent)
+    expect(options).toEqual(['gpt-image-2'])
+    fireEvent.change(input, { target: { value: 'fallback-typed-model' } })
+    await waitFor(() => expect(input.value).toBe('fallback-typed-model'))
+  })
+})
+
+describe('Settings form accessibility', () => {
+  it('可通过可见字段名定位模型选择控件和凭据输入', async () => {
+    mountPanel()
+    fireEvent.click(screen.getByRole('tab', { name: '提供方与模型' }))
+
+    // 模型分层保留可手填输入，并通过显式 combobox 语义暴露 DSH 候选菜单。
+    expect(await screen.findByRole('combobox', { name: '线框图' })).toBeTruthy()
+    expect(screen.getByRole('combobox', { name: '高保真' })).toBeTruthy()
+    expect(await screen.findByLabelText('DASHSCOPE_API_KEY 密钥')).toBeTruthy()
+  })
+
+  it('可通过可见字段名定位轮询超时和默认尺寸', () => {
+    mountPanel()
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+
+    expect(screen.getByRole('spinbutton', { name: '轮询超时' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '默认尺寸' })).toBeTruthy()
+  })
+})
+
+describe('设置下拉视觉一致性', () => {
+  it('默认尺寸使用 DSH 菜单并在选择后更新草稿', async () => {
+    const { container } = mountPanel()
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+
+    expect(container.querySelector('select')).toBeNull()
+    const trigger = screen.getByRole('button', { name: '默认尺寸' })
+    expect(trigger.getAttribute('aria-haspopup')).toBe('menu')
+
+    fireEvent.click(trigger)
+    const menu = await screen.findByRole('menu')
+    fireEvent.click(within(menu).getByRole('menuitem', { name: '1280*720' }))
+
+    expect(screen.queryByRole('menu')).toBeNull()
+    expect(trigger.textContent).toContain('1280*720')
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '保存' }).disabled).toBe(false)
+    expect(document.activeElement).toBe(trigger)
+  })
+
+  it('Esc 只关闭尺寸菜单并把焦点还给触发器，不泄漏给宿主弹窗', async () => {
+    let hostEscapeCount = 0
+    const observeHostEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') hostEscapeCount += 1
+    }
+    document.addEventListener('keydown', observeHostEscape)
+    try {
+      mountPanel()
+      fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+      const trigger = screen.getByRole<HTMLButtonElement>('button', { name: '默认尺寸' })
+      fireEvent.click(trigger)
+      const option = await screen.findByRole('menuitem', { name: '1024*1024' })
+      option.focus()
+
+      fireEvent.keyDown(option, { key: 'Escape' })
+
+      expect(screen.queryByRole('menu')).toBeNull()
+      expect(hostEscapeCount).toBe(0)
+      expect(document.activeElement).toBe(trigger)
+    } finally {
+      document.removeEventListener('keydown', observeHostEscape)
+    }
+  })
+
+  it('部署层提供自定义尺寸时如实显示，不冒充跟随默认', () => {
+    mountPanel({ prefs: createPrefs({ ...DEFAULT_PREFS, defaultSize: '2048*1152' }) })
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+
+    expect(screen.getByRole('button', { name: '默认尺寸' }).textContent).toContain('2048*1152')
+  })
+})
+
+describe('PreferencesPage dirty state', () => {
+  it('只读设置显示提示并禁用所有偏好修改入口', () => {
+    mountPanel({ prefs: createPrefs(DEFAULT_PREFS, { writable: false }) })
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+
+    expect(screen.getByText(/进程内模式或只读/)).toBeTruthy()
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: 'Mobile' }).disabled).toBe(true)
+    expect(screen.getByRole<HTMLInputElement>('spinbutton', { name: '轮询超时' }).disabled).toBe(
+      true,
+    )
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '恢复默认' }).disabled).toBe(true)
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '保存' }).disabled).toBe(true)
+  })
+
+  it('进程内设置显示非持久化提示并禁用偏好修改', () => {
+    mountPanel({ prefs: createPrefs(DEFAULT_PREFS, { mode: 'memory' }) })
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+
+    expect(screen.getByText(/进程内模式或只读/)).toBeTruthy()
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: 'Web' }).disabled).toBe(true)
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '默认尺寸' }).disabled).toBe(true)
+  })
+
+  it('草稿恢复为保存值后立即重新禁用保存按钮', () => {
+    mountPanel()
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+    const save = screen.getByRole<HTMLButtonElement>('button', { name: '保存' })
+    expect(save.disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Mobile' }))
+    expect(save.disabled).toBe(false)
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Web' }))
+    expect(save.disabled).toBe(true)
+  })
+
+  it('保存成功通过礼貌状态区播报', async () => {
+    mountPanel()
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Mobile' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存' }))
+
+    expect((await screen.findByRole('status')).textContent).toBe('已保存 ✓')
+  })
+
+  it('保存期间禁用编辑和恢复默认，避免旧操作覆盖新草稿', async () => {
+    const gate = deferred<void>()
+    mountPanel({ prefs: createPrefs(DEFAULT_PREFS, { firstWriteGate: gate.promise }) })
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Mobile' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存' }))
+
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: 'Web' }).disabled).toBe(true)
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: 'Mobile' }).disabled).toBe(true)
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '恢复默认' }).disabled).toBe(true)
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '保存' }).disabled).toBe(true)
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Web' }))
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: 'Mobile' }).checked).toBe(true)
+
+    gate.resolve()
+    expect((await screen.findByRole('status')).textContent).toBe('已保存 ✓')
+  })
+
+  it('写入 resolve 但快照未变化时保留 dirty 并报告失败', async () => {
+    mountPanel({ prefs: createPrefs(DEFAULT_PREFS, { applyWrites: false }) })
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Mobile' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存' }))
+
+    await screen.findByText(
+      '「defaultPlatform」未写入设置存储，保存已中止；之前的字段可能已落盘，请核对后重试。',
+    )
+    expect(screen.queryByText('已保存 ✓')).toBeNull()
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '保存' }).disabled).toBe(false)
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: 'Mobile' }).checked).toBe(true)
+  })
+
+  it('单字段写入失败时立即中止并点名，已写字段如实保留', async () => {
+    const prefs = createPrefs(DEFAULT_PREFS, { failFields: ['defaultCount'] })
+    mountPanel({ prefs })
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Mobile' }))
+    fireEvent.click(screen.getByRole('radio', { name: '3' }))
+    fireEvent.click(screen.getByRole('button', { name: '保存' }))
+
+    await screen.findByText(
+      '「defaultCount」未写入设置存储，保存已中止；之前的字段可能已落盘，请核对后重试。',
+    )
+    // 失败字段之前的写入已落盘（提示如实说明），之后的字段不再写入
+    expect(prefs.getSnapshot().user).toMatchObject({
+      defaultFidelity: 'wireframe',
+      defaultPlatform: 'mobile',
+    })
+    expect(prefs.getSnapshot().user).not.toHaveProperty('defaultCount')
+    expect(prefs.getSnapshot().user).not.toHaveProperty('defaultSize')
+    // 草稿与 dirty 保留，可直接重试（写入幂等）
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: '保存' }).disabled).toBe(false)
+  })
+
+  it('恢复默认未落盘时保留当前草稿并报告失败', async () => {
+    mountPanel({
+      prefs: createPrefs(DEFAULT_PREFS, {
+        applyWrites: false,
+        base: DEFAULT_PREFS,
+        user: { defaultPlatform: 'mobile', defaultCount: 3 },
+      }),
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+    fireEvent.click(screen.getByRole('button', { name: '恢复默认' }))
+
+    await screen.findByText('设置存储未确认本次更改，请重试。')
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: 'Mobile' }).checked).toBe(true)
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: '3' }).checked).toBe(true)
+  })
+
+  it('恢复默认成功后采用配置层 base 而不是内置默认', async () => {
+    const customBase = { ...DEFAULT_PREFS, defaultPlatform: 'mobile' as const, defaultCount: 3 }
+    mountPanel({
+      prefs: createPrefs(DEFAULT_PREFS, {
+        base: customBase,
+        user: { defaultPlatform: 'web', defaultCount: 2 },
+      }),
+    })
+    fireEvent.click(screen.getByRole('tab', { name: '生成偏好' }))
+    fireEvent.click(screen.getByRole('button', { name: '恢复默认' }))
+
+    expect((await screen.findByRole('status')).textContent).toBe('已保存 ✓')
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: 'Mobile' }).checked).toBe(true)
+    expect(screen.getByRole<HTMLInputElement>('radio', { name: '3' }).checked).toBe(true)
+  })
+})
+
+describe('HistoryPage search', () => {
+  it.each([
+    [0, '共 0 条'],
+    [1, '共 1 条'],
+    [5, '共 5 条'],
+  ])('单页或空态 total=%i 时仍显示总条数且不显示分页按钮', async (historyTotal, copy) => {
+    mountPanel({ historyTotal })
+    fireEvent.click(screen.getByRole('tab', { name: '生成历史' }))
+
+    expect(await screen.findByText(copy)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '上一页' })).toBeNull()
+    expect(screen.queryByRole('button', { name: '下一页' })).toBeNull()
+  })
+
+  it('多页同时显示总条数和分页按钮', async () => {
+    mountPanel({ historyTotal: 6 })
+    fireEvent.click(screen.getByRole('tab', { name: '生成历史' }))
+
+    expect(await screen.findByText('共 6 条')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '上一页' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '下一页' })).toBeTruthy()
+  })
+
+  it('输入草稿时保留当前结果并提示，点击搜索后从第 1 页提交', async () => {
+    const { calls } = mountPanel({ historyTotal: 6 })
+    fireEvent.click(screen.getByRole('tab', { name: '生成历史' }))
+    const search = await screen.findByRole('searchbox', { name: '搜索生成历史' })
+    await waitFor(() => {
+      expect(calls.filter((args) => args[0] === 'history/list')).toHaveLength(1)
+    })
+
+    fireEvent.change(search, { target: { value: '登录' } })
+    expect(calls.filter((args) => args[0] === 'history/list')).toHaveLength(1)
+    expect(screen.getByRole('status').textContent).toContain('搜索条件已更改')
+
+    fireEvent.click(screen.getByRole('button', { name: '搜索' }))
+    await waitFor(() => {
+      const historyCalls = calls.filter((args) => args[0] === 'history/list')
+      expect(historyCalls).toHaveLength(2)
+      expect(historyCalls[1]?.[1]).toMatchObject({ query: '登录', page: 1 })
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: '下一页' }))
+    await waitFor(() => {
+      const historyCalls = calls.filter((args) => args[0] === 'history/list')
+      expect(historyCalls.at(-1)?.[1]).toMatchObject({ query: '登录', page: 2 })
+    })
+  })
+
+  it('按 Enter 与搜索按钮使用相同的提交语义', async () => {
+    const { calls } = mountPanel()
+    fireEvent.click(screen.getByRole('tab', { name: '生成历史' }))
+    const search = await screen.findByRole('searchbox', { name: '搜索生成历史' })
+
+    fireEvent.change(search, { target: { value: '仪表盘' } })
+    fireEvent.keyDown(search, { key: 'Enter', code: 'Enter' })
+
+    await waitFor(() => {
+      const historyCalls = calls.filter((args) => args[0] === 'history/list')
+      expect(historyCalls.at(-1)?.[1]).toMatchObject({ query: '仪表盘', page: 1 })
+    })
+  })
+
+  it('清空历史后仍按已提交条件重载结果', async () => {
+    const { calls } = mountPanel({ historyTotal: 6 })
+    fireEvent.click(screen.getByRole('tab', { name: '生成历史' }))
+    const search = await screen.findByRole('searchbox', { name: '搜索生成历史' })
+    fireEvent.change(search, { target: { value: '登录' } })
+    fireEvent.click(screen.getByRole('button', { name: '搜索' }))
+    await waitFor(() => {
+      expect(calls.filter((args) => args[0] === 'history/list')).toHaveLength(2)
+    })
+
+    fireEvent.change(search, { target: { value: '仪表盘' } })
+    expect(screen.getByRole('status').textContent).toContain('搜索条件已更改')
+
+    fireEvent.click(screen.getByRole('button', { name: '清空历史' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认清空?' }))
+
+    await waitFor(() => {
+      expect(calls.some((args) => args[0] === 'history/clear')).toBe(true)
+      const historyCalls = calls.filter((args) => args[0] === 'history/list')
+      expect(historyCalls.at(-1)?.[1]).toMatchObject({ query: '登录', page: 1 })
+    })
+  })
+
+  it('工作区或连接变化后「只看方向稿」勾选态与请求参数一起复位', async () => {
+    const first = createConnection({ historyTotal: 6 })
+    const prefs = createPrefs()
+    const view = render(<UiMockupSection t={t} prefs={prefs} connection={first.connection} />)
+    fireEvent.click(screen.getByRole('tab', { name: '生成历史' }))
+    const draftOnly = await screen.findByRole<HTMLInputElement>('checkbox', {
+      name: '只看方向稿',
+    })
+    await waitFor(() => {
+      expect(first.calls.filter((args) => args[0] === 'history/list')).toHaveLength(1)
+    })
+
+    fireEvent.click(draftOnly)
+    await waitFor(() => {
+      const historyCalls = first.calls.filter((args) => args[0] === 'history/list')
+      expect(historyCalls.at(-1)?.[1]).toMatchObject({ draftOnly: true, page: 1 })
+    })
+    expect(draftOnly.checked).toBe(true)
+
+    // 换连接等价于切工作区：新请求拉全量，勾选态必须同步复位，
+    // 否则界面显示已过滤但内容是全量，后续翻页又会错位
+    const second = createConnection({ historyTotal: 6 })
+    view.rerender(<UiMockupSection t={t} prefs={prefs} connection={second.connection} />)
+    await waitFor(() => {
+      const historyCalls = second.calls.filter((args) => args[0] === 'history/list')
+      expect(historyCalls).toHaveLength(1)
+      expect(historyCalls[0]?.[1]).not.toHaveProperty('draftOnly')
+    })
+    expect(screen.getByRole<HTMLInputElement>('checkbox', { name: '只看方向稿' }).checked).toBe(
+      false,
+    )
+  })
+})
